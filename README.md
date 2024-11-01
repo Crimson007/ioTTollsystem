@@ -12,8 +12,13 @@ Runs the app in the development mode.\
 Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
 
 The page will reload when you make changes.\
-You may also see any lint errors in the console.
 
+
+Note that the back-end is also included in the toll-system folder(server.js). you should initialise it by 
+changing to its directory then run this command:
+### `node server`
+
+You may also see any lint errors in the console.
 ### `npm test`
 
 Launches the test runner in the interactive watch mode.\
