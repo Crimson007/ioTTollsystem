@@ -1,11 +1,11 @@
-// server.js
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const axios = require('axios'); // for API requests
-const app = express();
+const axios = require('axios');
 const { Buffer } = require('buffer');
 require('dotenv').config();
+
+const app = express();
 
 // Middleware
 app.use(express.json());
@@ -31,7 +31,7 @@ const connectToDatabase = async () => {
 
 connectToDatabase();
 
-// Define the Vehicle schema and model
+// Vehicle Schema
 const vehicleSchema = new mongoose.Schema({
   licensePlate: String,
   ownerName: String,
@@ -44,28 +44,77 @@ const vehicleSchema = new mongoose.Schema({
 
 const Vehicle = mongoose.model('Vehicle', vehicleSchema);
 
-// M-Pesa Functions
+// Transaction Schema
+const transactionSchema = new mongoose.Schema({
+  licensePlate: {
+    type: String,
+    required: true
+  },
+  phoneNumber: {
+    type: String,
+    required: true
+  },
+  amount: {
+    type: Number,
+    required: true,
+    default: 1
+  },
+  status: {
+    type: String,
+    enum: ['pending', 'success', 'failed'],
+    default: 'pending'
+  },
+  mpesaReceiptNumber: String,
+  checkoutRequestID: String,
+  merchantRequestID: String,
+  transactionDate: {
+    type: Date,
+    default: Date.now
+  }
+}, {
+  timestamps: true
+});
+
+const Transaction = mongoose.model('Transaction', transactionSchema);
+
+// M-Pesa Token Handling
+let mpesaAccessToken = null;
+let tokenExpiryTime = null;
+
 async function getMpesaAccessToken() {
-  const consumerKey = process.env.MPESA_CONSUMER_KEY;
-  const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
-  const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
+  try {
+    const consumerKey = process.env.MPESA_CONSUMER_KEY;
+    const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
+    const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
 
-  const response = await axios.get('https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
-    headers: { Authorization: `Basic ${auth}` }
-  });
+    const response = await axios.get('https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
+      headers: { Authorization: `Basic ${auth}` }
+    });
 
-  return response.data.access_token;
+    mpesaAccessToken = response.data.access_token;
+    tokenExpiryTime = Date.now() + 55 * 60 * 1000;
+    console.log("Access token refreshed");
+  } catch (error) {
+    console.error("Error fetching access token:", error.message);
+    throw error;
+  }
 }
 
+// Schedule token refresh
+setInterval(async () => {
+  if (!mpesaAccessToken || Date.now() >= tokenExpiryTime) {
+    await getMpesaAccessToken();
+  }
+}, 55 * 60 * 1000);
 
+// Initial token fetch
+getMpesaAccessToken();
 
-async function initiateMpesaPayment(phone, amount = 100) {
+async function initiateMpesaPayment(phone, amount = 1) {
   try {
-    const token = await getMpesaAccessToken(); // Ensure you have a function to get the access token
     const timestamp = new Date().toISOString().slice(0, 19).replace(/[-T:]/g, '');
     const password = Buffer.from(`${process.env.MPESA_SHORTCODE}${process.env.MPESA_PASSKEY}${timestamp}`).toString('base64');
 
-    // Format phone number to international format without "+" sign
     const formattedPhone = phone.startsWith("0") ? `254${phone.slice(1)}` : phone;
 
     const response = await axios.post(
@@ -84,7 +133,7 @@ async function initiateMpesaPayment(phone, amount = 100) {
         TransactionDesc: 'Toll Fee Payment'
       },
       {
-        headers: { Authorization: `Bearer ${token}` }
+        headers: { Authorization: `Bearer ${mpesaAccessToken}` }
       }
     );
 
@@ -95,15 +144,12 @@ async function initiateMpesaPayment(phone, amount = 100) {
   }
 }
 
-
-
 // Routes
-app.get('/', (req, res) => res.send("API is running"));
+app.get('/', (req, res) => res.send("API is running..."));
 
 app.post('/register', async (req, res) => {
   try {
-    const { licensePlate, ownerName, carType, brand, color, contact, registrationDate } = req.body;
-    const vehicle = new Vehicle({ licensePlate, ownerName, carType, brand, color, contact, registrationDate });
+    const vehicle = new Vehicle(req.body);
     await vehicle.save();
     res.status(201).send({ message: "✔️ Successful Registration" });
   } catch (error) {
@@ -113,51 +159,156 @@ app.post('/register', async (req, res) => {
 
 app.post('/verify', async (req, res) => {
   try {
-    const { licensePlate, phone } = req.body;
+    const { licensePlate, phoneNumber } = req.body;
     const vehicle = await Vehicle.findOne({ licensePlate });
 
-    if (vehicle) {
-      // Vehicle found, initiate M-Pesa payment
-      const paymentResponse = await initiateMpesaPayment(phone);
+    if (!vehicle) {
+      return res.status(404).send({ 
+        registered: false, 
+        message: "Vehicle not found. Please register first." 
+      });
+    }
 
-      if (paymentResponse.ResponseCode === "0") {
-        res.status(200).send({
-          registered: true,
-          message: "Payment initiated successfully. Please complete the payment on your M-Pesa.",
-          paymentResponse
-        });
-      } else {
-        res.status(500).send({
-          registered: true,
-          message: "Payment initiation failed. Please try again.",
-          paymentResponse
-        });
-      }
+    const paymentResponse = await initiateMpesaPayment(phoneNumber);
+    console.log("Payment initiation response:", paymentResponse);
+
+    if (paymentResponse.ResponseCode === "0") {
+      const transaction = new Transaction({
+        licensePlate,
+        phoneNumber,
+        amount: 1,
+        status: 'pending',
+        checkoutRequestID: paymentResponse.CheckoutRequestID,
+        merchantRequestID: paymentResponse.MerchantRequestID
+      });
+      
+      await transaction.save();
+      console.log("Transaction created:", transaction);
+
+      res.status(200).send({
+        registered: true,
+        message: "Payment initiated successfully",
+        vehicle,
+        transactionId: transaction._id
+      });
     } else {
-      // Vehicle not found
-      res.status(404).send({ registered: false, message: "Vehicle not found. Please register first." });
+      res.status(400).send({
+        registered: true,
+        message: "Payment initiation failed",
+        error: paymentResponse.ResponseDescription
+      });
     }
   } catch (error) {
-    res.status(500).send({ message: "Error verifying vehicle", error });
+    console.error('Verify endpoint error:', error);
+    res.status(500).send({ 
+      message: "Error processing request", 
+      error: error.message 
+    });
   }
 });
 
-// M-Pesa Callback Route
-app.post('/mpesa/callback', (req, res) => {
-  const { Body } = req.body;
+app.post('/mpesa/callback', async (req, res) => {
+  try {
+    console.log("M-Pesa callback received:", JSON.stringify(req.body, null, 2));
+    
+    const { Body } = req.body;
+    const { stkCallback } = Body;
+    
+    const transaction = await Transaction.findOne({
+      checkoutRequestID: stkCallback.CheckoutRequestID,
+      status: 'pending'
+    }).sort({ createdAt: -1 });
 
-  // Check if the transaction was successful
-  if (Body.stkCallback.ResultCode === 0) {
-    // Payment was successful
-    console.log("Payment successful for phone:", Body.stkCallback.CallbackMetadata.Item[4].Value);
-  } else {
-    console.log("Payment failed with message:", Body.stkCallback.ResultDesc);
+    if (!transaction) {
+      console.log("Transaction not found for CheckoutRequestID:", stkCallback.CheckoutRequestID);
+      return res.status(404).send({ message: "Transaction not found" });
+    }
+
+    if (stkCallback.ResultCode === 0) {
+      const metadata = stkCallback.CallbackMetadata.Item;
+      const mpesaReceiptNumber = metadata.find(item => item.Name === "MpesaReceiptNumber")?.Value;
+      
+      transaction.status = 'success';
+      transaction.mpesaReceiptNumber = mpesaReceiptNumber;
+    } else {
+      transaction.status = 'failed';
+    }
+
+    await transaction.save();
+    console.log(`Transaction ${transaction._id} updated:`, {
+      status: transaction.status,
+      mpesaReceiptNumber: transaction.mpesaReceiptNumber,
+      updatedAt: transaction.updatedAt
+    });
+
+    res.status(200).send({
+      status: "success",
+      message: "Callback processed successfully"
+    });
+  } catch (error) {
+    console.error("M-Pesa callback error:", error);
+    res.status(500).send({ 
+      status: "error", 
+      message: error.message 
+    });
   }
-
-  // Respond to M-Pesa
-  res.status(200).send("Received");
 });
 
-// Start the server
+app.post('/test-callback/:transactionId', async (req, res) => {
+  try {
+    const transaction = await Transaction.findById(req.params.transactionId);
+    if (!transaction) {
+      return res.status(404).send({ message: "Transaction not found" });
+    }
+
+    transaction.status = 'success';
+    transaction.mpesaReceiptNumber = 'TEST' + Date.now();
+    await transaction.save();
+
+    res.status(200).send({
+      message: "Test callback processed successfully",
+      transaction
+    });
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+});
+
+// In server.js
+app.get('/transaction-status/:id', async (req, res) => {
+  try {
+    const transaction = await Transaction.findById(req.params.id);
+    
+    if (!transaction) {
+      return res.status(404).send({ 
+        status: 'error',
+        message: "Transaction not found" 
+      });
+    }
+
+    // Add timestamp for debugging
+    console.log(`Status check for transaction ${req.params.id}:`, {
+      status: transaction.status,
+      checkoutRequestID: transaction.checkoutRequestID,
+      updatedAt: transaction.updatedAt,
+      timestamp: new Date()
+    });
+
+    res.status(200).send({
+      status: transaction.status,
+      transactionId: transaction._id,
+      mpesaReceiptNumber: transaction.mpesaReceiptNumber,
+      updatedAt: transaction.updatedAt
+    });
+  } catch (error) {
+    console.error("Transaction status error:", error);
+    res.status(500).send({ 
+      status: 'error',
+      message: "Error fetching transaction status", 
+      error: error.message 
+    });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
