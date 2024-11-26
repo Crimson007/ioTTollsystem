@@ -9,6 +9,7 @@ const Verify = () => {
   const [transactionId, setTransactionId] = useState(null);
   const [transactionStatus, setTransactionStatus] = useState(null);
   const [errors, setErrors] = useState({});
+  // eslint-disable-next-line no-unused-vars
   const [pollCount, setPollCount] = useState(0); // Add counter for polling attempts
 
   useEffect(() => {

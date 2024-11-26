@@ -34,8 +34,8 @@ const Register = () => {
     });
 
     // Phone number validation (Kenyan format: starts with 07 and has 10 digits)
-    if (formData.contact && !/^07\d{8}$/.test(formData.contact)) {
-      newErrors.contact = 'Phone number must start with "07" and contain 10 digits.';
+    if (formData.contact && !/^(07|01)\d{8}$/.test(formData.contact)) {
+      newErrors.contact = 'Phone number must start with "07" or "01" and contain 10 digits.';
     }
     
     setErrors(newErrors);
